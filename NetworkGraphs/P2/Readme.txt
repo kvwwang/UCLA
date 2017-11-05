@@ -1,1 +1,1 @@
-Project 2
+Project 2 - IMDb Database Exploration & Graph Analysis
