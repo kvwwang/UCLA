@@ -1,0 +1,373 @@
+---
+title: "Modeling Mortgage Applications: Modeling (Capstone Part 2/2)"
+author: "Kevin Wang"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval=FALSE)
+```
+
+*Note: eval set to False as modeling was done using a script, so results were already obtained prior. Pictures of relevant outputs are included instead. Re-computation would take an excessive amount of time. Set eval to true to run from scratch.*
+
+First, reload the 1 million subset of data from before:
+
+```{r, echo=FALSE, message=FALSE}
+library(data.table)
+library(ggplot2)
+library(MASS)
+library(stringr)
+library(writexl)
+library(caret)
+library(mice)
+library(MLeval)
+library(sparklyr)
+library(dplyr)
+
+setwd("E:/Extension/DSI/Capstone")
+```
+
+```{r, eval=FALSE}
+hmda_fill <- fread("testset1_imp.csv")
+hmda_fill$V1 <- NULL
+
+factorcols <- colnames(hmda_fill)
+factorcols <- factorcols[!factorcols %in% c("loan_amount_000s","applicant_income_000s","population",
+                                            "minority_population","hud_median_family_income",
+                                            "tract_to_msamd_income","number_of_owner_occupied_units",
+                                            "number_of_1_to_4_family_units","rate_spread")]
+hmda_fill[,(factorcols):= lapply(.SD, as.factor), .SDcols = factorcols]
+```
+
+Before processing in models, re-level and set the race factor "5" (white) as the reference, since white comprised the vast majority of the observations:
+
+```{r, eval=FALSE}
+hmda_fill$applicant_race_1 <- relevel(hmda_fill$applicant_race_1,ref="5")
+hmda_fill$co_applicant_race_1 <- relevel(hmda_fill$co_applicant_race_1,ref="5")
+```
+
+The models will be binary classification models with T/F for whether a mortgage was accepted as the dependent variable.
+
+Proceed with an initial logistic regression. 
+
+```{r, eval=FALSE}
+model01 <- glm(approved ~ .-action_taken, data = hmda_fill, family = "binomial",na.action = na.omit)
+summary(model01)
+```
+
+![Part 1 of model01 summary](mod1.png)
+![Part 2 of model01 summary](mod12.png)
+
+Some initial observations from the results: 
+
+1. Conventional loans had higher acceptance than other types of loans
+2. Loan amount had a negative coefficient but was not significant
+3. Higher applicant income was significantly positive
+4. Ethnicity: not Hispanic/Latino was significantly positive
+5. Minority races were all significantly negative compared to White 
+    + Except Asian for the primary applicant
+6. Listing more than one race was significantly negative
+7. Majority of features were significant
+
+### StepAIC
+
+Normally, stepAIC can be used to assist in feature selection. However, the dataset was too large for the function to process within a reasonable amount of time. Even taking a smaller subset of features did not accomplish much, as AIC typically increased. (In example, AIC nearly doubled)
+
+```{r}
+m2step <- stepAIC(model01,steps=5)
+
+model03 <- glm(approved ~ .-action_taken-loan_amount_000s-preapproval
+               -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex
+               -purchaser_type, data = hmda_fill, family = "binomial",na.action = na.omit)
+summary(model03)
+
+m3step <- stepAIC(model03,steps=5)
+```
+
+## Cross-validation
+
+Run 5-fold cross-validation to save computation time. Train with logistic regression first, then compare results with “rpart” tree model. 
+
+```{r}
+control = trainControl(method="cv", number=5, verboseIter = TRUE)
+metric = "Accuracy"
+
+set.seed(100)
+log_fit <- train(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+                 -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+                 data=hmda_fill, method="glm", family = "binomial",
+                 metric=metric, trControl=control, na.action = na.omit)
+summary(log_fit)
+
+set.seed(100)
+tree_fit <- train(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+                  -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+                  data=hmda_fill, method="rpart",
+                  metric=metric, trControl=control, na.action = na.omit)
+
+results = resamples(list(log=log_fit, tree=tree_fit ) )
+summary(results)
+```
+
+![Logistic and Tree Models](logtree1.png)
+
+Decent accuracy, but poor Kappa. The runtime was already starting to get very long, so take a further subset of data of 100,000 observations.
+
+```{r}
+set.seed(1)
+hmda_fill <- hmda_fill[sample(.N,100000)]
+```
+
+## Different classifiers
+
+The next model to try is the KNN classifier.
+
+```{r}
+set.seed(100)
+knn_fit <- train(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+                 -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+                 data=hmda_fill, method="knn", 
+                 metric=metric, trControl=control, na.action = na.omit)
+
+set.seed(100)
+log_fit <- train(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+                 -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+                 data=hmda_fill, method="glm", family = "binomial",
+                 metric=metric, trControl=control, na.action = na.omit)
+
+results = resamples(list(log=log_fit, knn=knn_fit ) )
+summary(results)
+```
+
+![Logistic and KNN Models](logknn1.png)
+
+With K=9 in final model, KNN had poor scores compared to the other models, in addition to being much slower. Proceed with Random Forest:
+
+```{r}
+set.seed(100)
+rf_fit <- train(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+                -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+                data=hmda_fill, method="rf", 
+                metric=metric, trControl=control, na.action = na.omit)
+
+results = resamples(list(log=log_fit, rf=rf_fit ) )
+summary(results)
+```
+
+![Logistic and Random Forest Models](logrf1.png)
+
+The model had better Kappa, but took very long to run (about 1 hour).
+
+One thought to consider is the fact that in the original data, ~75% of observations were approved. If the models merely predicted "1" for all testing values, then the accuracy would be 75%. Check confusion matrices to make sure this isn't happening:
+
+```{r}
+confusionMatrix.train(rf_fit)
+confusionMatrix.train(log_fit)
+```
+
+![Logistic and Random Forest Confusion Matrices](logrf2.png)
+
+Examine SVM and XGBoost models. SVM runtime was extremely long and did not finish in a reasonable amount of time, so only proceed with XGBoost.
+
+```{r}
+# set.seed(100)
+# svm_fit <- train(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+#                  -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+#                  data=hmda_fill, method="svmRadial", 
+#                  metric=metric, trControl=control, na.action = na.omit)
+
+set.seed(100)
+xgb_fit <- train(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+                 -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+                 data=hmda_fill, method="xgbLinear", 
+                 metric=metric, trControl=control, na.action = na.omit)
+
+results = resamples(list(log=log_fit, xgb=xgb_fit ) )
+summary(results)
+```
+
+![Logistic and XGBoost Models](logxgb1.png)
+
+![Logistic and XGBoost Confusion Matrices](logxgb2.png)
+
+XGBoost was much faster compared to random forest with comparable results. 
+
+In summary, all models had approximately the same accuracy, but Kappa noticeably improved for Random Forest and XGBoost. XGBoost's much faster computation time gives it the advantage.
+
+## Further Model Exploration
+
+Due to improved performance and runtime, examine Logistic and XGBoost models more in-depth.
+
+If stepAIC is tried on the reduced 100k dataset, then iterations still take a very long time, and the resulting model does not improve AIC.
+
+```{r}
+model100k <- glm(approved ~ .-action_taken
+                 -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+                 data = hmda_fill, family = "binomial",na.action = na.omit)
+summary(model100k)
+
+m100step <- stepAIC(model100k,steps=5)
+summary(m100step)
+```
+
+### AUC-ROC
+
+Some AUC-ROC curves can be generated for both logistic and XGBoost models:
+
+```{r}
+control2 = trainControl(method="cv", number=5, verboseIter = TRUE,
+                       summaryFunction = twoClassSummary, classProbs = TRUE,
+                       savePredictions = TRUE)
+
+hmda_df <- data.frame(hmda_fill)
+
+mnames <- function(x) {
+  levels(hmda_df[,x]) <- make.names(levels(hmda_df[,x])) 
+  return (hmda_df[,x])
+}
+cols <- colnames(hmda_df)
+hmda_df[,cols] <- lapply(cols,mnames)
+
+set.seed(100)
+log_fit <- train(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+                 -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+                 data=hmda_df, method="glm", family = "binomial",
+                 metric=metric, trControl=control2, na.action = na.omit)
+logev <- evalm(log_fit)
+
+set.seed(100)
+xgb_fit <- train(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+                 -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+                 data=hmda_df, method="xgbLinear", 
+                 metric=metric, trControl=control2, na.action = na.omit)
+xgbev <- evalm(xgb_fit)
+```
+
+![Logistic and XGBoost AUC-ROC](aucroc1.png)
+
+As mentioned before, ~75% of observations were approved vs ~25% rejected. Could this imbalance affect the results? Test imbalanced learning methods with Up and Down sampling to see if they improved the results:
+
+```{r}
+table(hmda_fill$approved)
+mean(as.numeric(hmda_fill$approved)-1)
+
+control3d = trainControl(method="cv", number=5, verboseIter = TRUE, sampling = "down")
+control3u = trainControl(method="cv", number=5, verboseIter = TRUE, sampling = "up")
+
+set.seed(100)
+log_fit_d <- train(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+                 -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+                 data=hmda_fill, method="glm", family = "binomial",
+                 metric=metric, trControl=control3d, na.action = na.omit)
+set.seed(100)
+log_fit_u <- train(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+                   -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+                   data=hmda_fill, method="glm", family = "binomial",
+                   metric=metric, trControl=control3u, na.action = na.omit)
+
+set.seed(100)
+xgb_fit_d <- train(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+                 -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+                 data=hmda_fill, method="xgbLinear", 
+                 metric=metric, trControl=control3d, na.action = na.omit)
+set.seed(100)
+xgb_fit_u <- train(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+                   -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+                   data=hmda_fill, method="xgbLinear", 
+                   metric=metric, trControl=control3u, na.action = na.omit)
+
+results = resamples(list(log_d=log_fit_d, log_u=log_fit_u,
+                         xgb_d=xgb_fit_d, xgb_u=xgb_fit_u))
+summary(results)
+
+control4 = trainControl(method="cv", number=5, verboseIter = TRUE,
+                        summaryFunction = twoClassSummary, classProbs = TRUE,
+                        savePredictions = TRUE, sampling = "down")
+
+set.seed(100)
+log_fit <- train(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+                 -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+                 data=hmda_df, method="glm", family = "binomial",
+                 metric=metric, trControl=control4, na.action = na.omit)
+logev <- evalm(log_fit)
+
+set.seed(100)
+xgb_fit <- train(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+                 -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+                 data=hmda_df, method="xgbLinear", 
+                 metric=metric, trControl=control4, na.action = na.omit)
+xgbev <- evalm(xgb_fit)
+
+control4 = trainControl(method="cv", number=5, verboseIter = TRUE,
+                        summaryFunction = twoClassSummary, classProbs = TRUE,
+                        savePredictions = TRUE, sampling = "up")
+
+set.seed(100)
+log_fit <- train(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+                 -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+                 data=hmda_df, method="glm", family = "binomial",
+                 metric=metric, trControl=control4, na.action = na.omit)
+logev <- evalm(log_fit)
+
+set.seed(100)
+xgb_fit <- train(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+                 -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+                 data=hmda_df, method="xgbLinear", 
+                 metric=metric, trControl=control4, na.action = na.omit)
+xgbev <- evalm(xgb_fit)
+```
+
+![Logistic and XGBoost Up/Down-sampling](updown1.png)
+
+![Logistic and XGBoost Up/Down-sampling AUC-ROC](aucroc2.png)
+
+## Spark
+
+Since the dataset was so large, Spark could potentially help speed up the process of analyzing and modeling the "big data." Try to time how long it takes to model using caret, and compare with Spark:
+
+```{r}
+set.seed(100)
+system.time(log_fitr <- train(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+                             -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex, 
+                             data=hmda_fill, method="glm", family = "binomial",
+                             metric=metric, trControl=control, na.action = na.omit))
+```
+
+Caret models took approximately 15 seconds. 
+
+For Spark, spark-specific model fitting functions must be used to perform regression along with cross-validation. Unfortunately, modeling would run indefinitely before freezing on my machine, but it did appear that copying the data into Spark would save on RAM usage (memory usage).
+
+```{r}
+sc <- spark_connect(master = "local")
+hmda_tbl <- copy_to(sc,hmda_fill)
+
+pipeline <- ml_pipeline(sc) %>% 
+  ft_r_formula(approved ~ .-action_taken-loan_amount_000s-purchaser_type
+               -co_applicant_race_1-co_applicant_ethnicity-co_applicant_sex) %>% 
+  ml_logistic_regression()
+
+cv <- ml_cross_validator(sc, estimator = pipeline, 
+                         evaluator = ml_binary_classification_evaluator(sc),
+                         estimator_param_maps = list(logistic_regression = list(elastic_net_param = 0)),
+                         num_folds = 5)
+
+log_fits <- ml_fit(cv, hmda_tbl)
+system.time(log_fits <- ml_fit(cv, hmda_tbl))
+```
+
+## Recommendations and Conclusions
+
+For further study, more modeling algorithms can be considered along with tuning a wider variety of model parameters. The dependent variable could also be changed; for instance, multiclass classification could be employed by using Action Taken instead of Approved as the dependent variable. Analyzing multiple years of HMDA data could enable use of panel data and predictive analytics. However, to do so, better hardware would be required for faster processing for  machine learning models, and more memory to handle extremely large datasets.
+
+Models can predict with ~75% accuracy whether a mortgage application will be approved, with XGBoost having the best performance when taking into account processing time in addition to scoring metrics.
+
+It appeared that since ethnicity/race/sex were significant in modeling, one could that there was in fact bias in mortgage approvals. However, one should consider socioeconomic factors before drawing any conclusions. As and example, the median applicant income varied between the different races, ethnicities, and sexes.
+
+
+
+
+
+
+
+
+

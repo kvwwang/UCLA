@@ -1,0 +1,492 @@
+---
+title: "Modeling Mortgage Applications: EDA/Cleaning (Capstone Part 1/2)"
+author: "Kevin Wang"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+*Note: eval set to False in some segments as modeling was done using a script, so results were already obtained prior. Pictures of relevant outputs are included instead. Re-computation would take an excessive amount of time. Set eval to true to run from scratch.*
+
+## Introduction
+
+The Consumer Financial Protection Bureau (CFPB) is a U.S. government agency responsible for protecting consumers from unfair treatment by financial institutions (banks, lenders, etc.) 
+
+The Home Mortgage Disclosure Act (HMDA) requires many institutions to publicly disclose mortgage data to the public. Data is available on their website at https://www.consumerfinance.gov/data-research/hmda/historic-data/
+
+
+```{r, echo=FALSE, message=FALSE}
+library(data.table)
+library(ggplot2)
+library(MASS)
+library(stringr)
+library(writexl)
+library(caret)
+library(mice)
+
+setwd("E:/Extension/DSI/Capstone")
+```
+
+## Data Acquisition 
+
+Data from 2007-2017 available for download on the website. It is available in both encoded
+and plain language forms. To save memory and processing power, use only the encoded data and consult the code explanation sheet to interpret the results.
+
+Download and analyze the 2017 data for now. If another year is desired, then simply change the file to be loaded.
+
+```{r, message=FALSE}
+data_all <- fread("hmda_2017_nationwide_all-records_codes.csv")
+```
+```{r}
+colnames(data_all)
+str(data_all)
+summary(data_all)
+```
+
+## Data Cleaning
+
+Lots of features to manage. Discard features where they were all NA (edit_status, sequence_number, application_date_indicator), all the same (as_of_year), and ID (respondent_id).
+
+```{r}
+hmda <- subset(data_all,select=-c(as_of_year,respondent_id,edit_status,
+                                  sequence_number,application_date_indicator))
+rm(data_all)
+```
+
+Not all applications featured a co-applicant. In addition, a large majority of people only listed 1 race.
+
+```{r}
+# 8 = no co-applicant
+table(hmda$co_applicant_race_1)
+
+# View % of (co)applicants who are multiracial
+sum(table(hmda$co_applicant_race_2))/nrow(hmda)
+sum(table(hmda$applicant_race_2))/nrow(hmda)
+```
+
+Create new Boolean features for whether applicant was multiracial and whether application had a co-applicant. 
+Also, take Action Taken as the feature to extract the future dependent variable from. Action taken is encoded as follows:
+
+Code | Meaning 
+-----| ---------- 
+1    | Loan Originated      
+2    | Application approved but not accepted
+3    | Application denied by financial institution        
+4    | Application withdrawn by applicant
+5    | File closed for incompleteness        
+6    | Loan purchased by institution
+7    | Preapproval request denied        
+8    | Preapproval request approved but not accepted
+
+Group actions 1,2, and 8 as "Approved" (1), else "Not approved" (0), creating a new binary feature.
+
+```{r}
+hmda$multirace <- ifelse(!is.na(hmda$applicant_race_2),yes=1,no=0)
+hmda$coapplicant <- ifelse(hmda$co_applicant_race_1==8,yes=0,no=1)
+hmda$approved <- ifelse((hmda$action_taken %in% c(1,2,8) ),yes=1,no=0)
+```
+
+Since a lot of the features are actually encoded factors, set said features as factors:
+
+```{r}
+factorcols <- colnames(hmda)
+factorcols <- factorcols[!factorcols %in% c("loan_amount_000s","applicant_income_000s","population",
+                                            "minority_population","hud_median_family_income",
+                                            "tract_to_msamd_income","number_of_owner_occupied_units",
+                                            "number_of_1_to_4_family_units","rate_spread")]
+hmda[,(factorcols):= lapply(.SD, as.factor), .SDcols = factorcols]
+
+str(hmda)
+summary(hmda)
+```
+
+## EDA
+
+Proceed with some EDA:
+
+```{r, echo=FALSE, warning=FALSE}
+ggplot(hmda, aes(x=action_taken)) +
+  geom_bar(aes(fill=action_taken)) +
+  theme_bw() +
+  labs(x="Action Taken",y="Count",title="2017 HMDA Actions") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+        legend.position = "none") + 
+  scale_fill_viridis_d() 
+
+ggplot(hmda, aes(x=loan_type)) +
+  geom_bar(aes(fill=loan_type)) +
+  theme_bw() +
+  labs(x="Loan Type",y="Count",title="2017 HMDA Loan Types") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+        legend.position = "none") + 
+  scale_fill_viridis_d() 
+
+ggplot(hmda, aes(x=action_taken)) +
+  geom_bar(aes(fill=loan_type),position="fill") +
+  theme_bw() +
+  labs(x="Action Taken",y="Percent",title="2017 HMDA Actions",fill="Loan Type") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+
+ggplot(hmda, aes(x=action_taken)) +
+  geom_bar(aes(fill=applicant_race_1),position="fill") +
+  theme_bw() +
+  labs(x="Action Taken",y="Percent",title="2017 HMDA Actions by Race 1",fill="Applicant Race 1") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+ggplot(hmda, aes(x=applicant_race_1)) +
+  geom_bar(aes(fill=action_taken),position="fill") +
+  theme_bw() +
+  labs(x="Applicant Race 1",y="Percent",title="2017 HMDA Actions by Race 1",fill="Action Taken") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+
+ggplot(hmda, aes(x=action_taken)) +
+  geom_bar(aes(fill=applicant_sex),position="fill") +
+  theme_bw() +
+  labs(x="Action Taken",y="Percent",title="2017 HMDA Actions by Sex",fill="Applicant Sex") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+ggplot(hmda, aes(x=applicant_sex)) +
+  geom_bar(aes(fill=action_taken),position="fill") +
+  theme_bw() +
+  labs(x="Applicant Sex",y="Percent",title="2017 HMDA Actions by Sex",fill="Action Taken") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+
+
+ggplot(hmda, aes(x=action_taken, y=applicant_income_000s, fill=action_taken)) + 
+  geom_violin()+
+  geom_boxplot(width=0.1, fill="white") + 
+  labs(x="Action Taken",y="Applicant Income in 1000s",title="2017 HMDA Actions by Income",fill="Income") + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+        legend.position = "none") + 
+    ylim(c(0,200))
+ggplot(hmda, aes(x=action_taken, y=applicant_income_000s, fill=action_taken)) + 
+  geom_violin()+
+  geom_boxplot(width=0.1, fill="white") + 
+  labs(x="Action Taken",y="Applicant Income in 1000s",title="2017 HMDA Actions by Income",fill="Income") + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+        legend.position = "none") + 
+  ylim(c(0,150))
+```
+
+It does appear that different values within some features affect the approval rates.
+
+Action 6 seems out of place. It represents transactions involving a loan being sold from one institution to another, not new mortgage applications. So removing them is prudent.
+
+```{r}
+hmda_reduced <-subset(hmda,select=-c(applicant_race_2,applicant_race_3,applicant_race_4,
+                             applicant_race_5,co_applicant_race_2,co_applicant_race_3,
+                             co_applicant_race_4,co_applicant_race_5))
+
+hmda_reduced <- subset(hmda_reduced, action_taken != 6)
+summary(hmda_reduced)
+rm(hmda)
+```
+
+```{r, echo=FALSE, warning=FALSE}
+ggplot(hmda_reduced, aes(x=approved)) +
+  geom_bar(aes(fill=loan_type),position="fill") +
+  theme_bw() +
+  labs(x="Approved",y="Percent",title="2017 HMDA Approvals",fill="Loan Type") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+ggplot(hmda_reduced, aes(x=loan_type)) +
+  geom_bar(aes(fill=approved),position="fill") +
+  theme_bw() +
+  labs(x="Loan Type",y="Percent",title="2017 HMDA Approvals",fill="Approved?") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+
+ggplot(hmda_reduced, aes(x=approved)) +
+  geom_bar(aes(fill=applicant_race_1),position="fill") +
+  theme_bw() +
+  labs(x="Approved",y="Percent",title="2017 HMDA Approvals by Race 1",fill="Applicant Race 1") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+ggplot(hmda_reduced, aes(x=applicant_race_1)) +
+  geom_bar(aes(fill=approved)) +
+  theme_bw() +
+  labs(x="Applicant Race 1",y="Percent",title="2017 HMDA Approvals by Race 1",fill="Approved?") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+
+ggplot(hmda_reduced, aes(x=approved)) +
+  geom_bar(aes(fill=applicant_sex),position="fill") +
+  theme_bw() +
+  labs(x="Approved",y="Percent",title="2017 HMDA Approvals by Sex",fill="Applicant Sex") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+ggplot(hmda_reduced, aes(x=applicant_sex)) +
+  geom_bar(aes(fill=approved),position="fill") +
+  theme_bw() +
+  labs(x="Applicant Sex",y="Percent",title="2017 HMDA Approvals by Sex",fill="Approved") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d()
+
+ggplot(hmda_reduced, aes(x=approved, y=applicant_income_000s, fill=approved)) + 
+  geom_violin()+
+  geom_boxplot(width=0.1, fill="white") + 
+  labs(x="Approved",y="Applicant Income in 1000s",title="2017 HMDA Approvals by Income") + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+        legend.position = "none") + 
+  ylim(c(0,200))
+
+ggplot(hmda_reduced, aes(x=approved, y=loan_amount_000s, fill=approved)) + 
+  geom_violin()+
+  geom_boxplot(width=0.1, fill="white") + 
+  labs(x="Approved",y="Loan Amount in 1000s",title="2017 HMDA Approvals by Loan Amount") + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+        legend.position = "none") + 
+  ylim(c(0,500))
+
+ggplot(hmda_reduced, aes(x=coapplicant)) +
+  geom_bar(aes(fill=approved),position="fill") +
+  theme_bw() +
+  labs(x="Coapplicant?",y="Percent",title="2017 HMDA Approvals by Coapplicant",fill="Approved?") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+
+ggplot(hmda_reduced, aes(x=multirace)) +
+  geom_bar(aes(fill=approved),position="fill") +
+  theme_bw() +
+  labs(x="Multiracial?",y="Percent",title="2017 HMDA Approvals by Multiracial",fill="Approved?") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+
+ggplot(hmda_reduced, aes(x=applicant_ethnicity)) +
+  geom_bar(aes(fill=approved),position="fill") +
+  theme_bw() +
+  labs(x="Ethnicity",y="Percent",title="2017 HMDA Approvals by Applicant Ethnicity",fill="Approved?") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+
+ggplot(hmda_reduced, aes(x=agency_code)) +
+  geom_bar(aes(fill=approved),position="fill") +
+  theme_bw() +
+  labs(x="Agency",y="Percent",title="2017 HMDA Approvals by Agency",fill="Approved?") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+
+ggplot(hmda_reduced, aes(x=property_type)) +
+  geom_bar(aes(fill=approved),position="fill") +
+  theme_bw() +
+  labs(x="Property Type",y="Percent",title="2017 HMDA Approvals by Property Type",fill="Approved?") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+
+ggplot(hmda_reduced, aes(x=loan_purpose)) +
+  geom_bar(aes(fill=approved),position="fill") +
+  theme_bw() +
+  labs(x="Loan Purpose",y="Percent",title="2017 HMDA Approvals by Loan Purpose",fill="Approved?") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+```
+
+Upon further inspection, action 4 could also be removed, as they represent instances where the applicant(s) took themselves out of consideration.
+
+```{r}
+hmda_reduced <- subset(hmda_reduced, action_taken != 4)
+summary(hmda_reduced)
+```
+
+```{r, echo=FALSE, warning=FALSE}
+ggplot(hmda_reduced, aes(x=approved)) +
+  geom_bar(aes(fill=loan_type),position="fill") +
+  theme_bw() +
+  labs(x="Approved",y="Percent",title="2017 HMDA Approvals",fill="Loan Type") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+ggplot(hmda_reduced, aes(x=loan_type)) +
+  geom_bar(aes(fill=approved),position="fill") +
+  theme_bw() +
+  labs(x="Loan Type",y="Percent",title="2017 HMDA Approvals",fill="Approved?") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+
+ggplot(hmda_reduced, aes(x=applicant_race_1)) +
+  geom_bar(aes(fill=approved),position="fill") +
+  theme_bw() +
+  labs(x="Applicant Race 1",y="Percent",title="2017 HMDA Approvals by Race 1",fill="Approved?") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+ggplot(hmda_reduced, aes(x=applicant_race_1)) +
+  geom_bar(aes(fill=approved)) +
+  theme_bw() +
+  labs(x="Applicant Race 1",y="Percent",title="2017 HMDA Approvals by Race 1",fill="Approved?") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+
+ggplot(hmda_reduced, aes(x=approved)) +
+  geom_bar(aes(fill=applicant_sex),position="fill") +
+  theme_bw() +
+  labs(x="Approved",y="Percent",title="2017 HMDA Approvals by Sex",fill="Applicant Sex") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+ggplot(hmda_reduced, aes(x=applicant_sex)) +
+  geom_bar(aes(fill=approved),position="fill") +
+  theme_bw() +
+  labs(x="Applicant Sex",y="Percent",title="2017 HMDA Approvals by Sex",fill="Approved") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d()
+
+ggplot(hmda_reduced, aes(x=approved, y=applicant_income_000s, fill=approved)) + 
+  geom_violin()+
+  geom_boxplot(width=0.1, fill="white") + 
+  labs(x="Approved",y="Applicant Income in 1000s",title="2017 HMDA Approvals by Income") + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+        legend.position = "none") + 
+  ylim(c(0,250))
+
+ggplot(hmda_reduced, aes(x=approved, y=loan_amount_000s, fill=approved)) + 
+  geom_violin()+
+  geom_boxplot(width=0.1, fill="white") + 
+  labs(x="Approved",y="Loan Amount in 1000s",title="2017 HMDA Approvals by Loan Amount") + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+        legend.position = "none") + 
+  ylim(c(0,800))
+
+ggplot(hmda_reduced, aes(x=coapplicant)) +
+  geom_bar(aes(fill=approved),position="fill") +
+  theme_bw() +
+  labs(x="Coapplicant?",y="Percent",title="2017 HMDA Approvals by Coapplicant",fill="Approved?") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+
+ggplot(hmda_reduced, aes(x=multirace)) +
+  geom_bar(aes(fill=approved),position="fill") +
+  theme_bw() +
+  labs(x="Multiracial?",y="Percent",title="2017 HMDA Approvals by Multiracial",fill="Approved?") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+
+ggplot(hmda_reduced, aes(x=applicant_ethnicity)) +
+  geom_bar(aes(fill=approved),position="fill") +
+  theme_bw() +
+  labs(x="Ethnicity",y="Percent",title="2017 HMDA Approvals by Applicant Ethnicity",fill="Approved?") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+
+ggplot(hmda_reduced, aes(x=agency_code)) +
+  geom_bar(aes(fill=approved),position="fill") +
+  theme_bw() +
+  labs(x="Agency",y="Percent",title="2017 HMDA Approvals by Agency",fill="Approved?") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+
+ggplot(hmda_reduced, aes(x=property_type)) +
+  geom_bar(aes(fill=approved),position="fill") +
+  theme_bw() +
+  labs(x="Property Type",y="Percent",title="2017 HMDA Approvals by Property Type",fill="Approved?") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+
+ggplot(hmda_reduced, aes(x=loan_purpose)) +
+  geom_bar(aes(fill=approved),position="fill") +
+  theme_bw() +
+  labs(x="Loan Purpose",y="Percent",title="2017 HMDA Approvals by Loan Purpose",fill="Approved?") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) + 
+  scale_fill_viridis_d() 
+
+```
+
+Now there certainly appears that some features may influence the mortgage approval rates.
+
+The state and county codes are included with the data. They can be converted into FIPS codes. The data can then be exported to Tableau to create a graphical map.
+
+```{r}
+hmda_reduced$state_code <- str_pad(hmda_reduced$state_code, 2, pad = "0")
+hmda_reduced$county_code <- str_pad(hmda_reduced$county_code, 3, pad = "0")
+
+hmda_reduced$fips <- paste0(hmda_reduced$state_code,hmda_reduced$county_code)
+hmda_reduced$fips <- as.factor(hmda_reduced$fips)
+
+str(hmda_reduced)
+```
+
+```{r, warning=FALSE, eval=FALSE}
+write.csv(hmda_reduced,"testcs.csv")
+```
+
+Lastly, produce a few plots showing the relationship between applicant income and race/ethnicity/sex:
+
+```{r, echo=FALSE, warning=FALSE}
+ggplot(hmda_reduced, aes(x=applicant_race_1, y=applicant_income_000s, fill=applicant_race_1)) + 
+  geom_violin()+
+  geom_boxplot(width=0.1, fill="white") + 
+  labs(x="Applicant Race",y="Income in 1000s",title="2017 Race/Income Plot") + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+        legend.position = "none") + 
+  scale_fill_viridis_d() +
+  ylim(c(0,250))
+
+ggplot(hmda_reduced, aes(x=applicant_sex, y=applicant_income_000s, fill=applicant_sex)) + 
+  geom_violin()+
+  geom_boxplot(width=0.1, fill="white") + 
+  labs(x="Applicant Sex",y="Income in 1000s",title="2017 Sex/Income Plot") + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+        legend.position = "none") + 
+  scale_fill_viridis_d() +
+  ylim(c(0,250))
+
+ggplot(hmda_reduced, aes(x=applicant_ethnicity, y=applicant_income_000s, fill=applicant_ethnicity)) + 
+  geom_violin()+
+  geom_boxplot(width=0.1, fill="white") + 
+  labs(x="Applicant Ethnicity",y="Income in 1000s",title="2017 Ethnicity/Income Plot") + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+        legend.position = "none") + 
+  scale_fill_viridis_d() +
+  ylim(c(0,250))
+```
+
+## Data Cleaning
+
+There are still a lot of features. Some more of them can be removed.
+
+Remove denial reason(s), since you cannot have a reason unless application was rejected; even in those cases many rejections had no denial reasons listed. Additionally, some features had many values that were NA or were almost all the same value; those can also be dropped.
+
+Due to performance/hardware constraints, categorical features with many different factors need to also be dropped. FIPS is dropped, for example, but the numerical features based on location remain. 10.5 million observations is still excessive, so take a 1 million observation subset to start with.
+
+```{r}
+hmda_ml <- subset(hmda_reduced, select=-c(denial_reason_1,denial_reason_2,denial_reason_3,
+                                        rate_spread,msamd,census_tract_number))
+str(hmda_ml)
+summary(hmda_ml)
+
+# Very long computational time, unfortunately remove features with large # of factors
+# Also hoepa_status, which is almost always 2
+hmda_ml <- subset(hmda_ml, select=-c(state_code,county_code,fips,hoepa_status))
+
+set.seed(1)
+hmda_ml <- hmda_ml[sample(.N,1000000)]
+# write.csv(hmda_ml,"testset1.csv")
+# hmda_ml <- fread("testset1.csv")
+# hmda_ml$V1 <- NULL
+
+str(hmda_ml)
+summary(hmda_ml)
+rm(hmda_reduced)
+```
+
+### Imputation
+
+There are still NA values remaining in the data. Visualize and impute the missing data with mice library, before exporting to CSV for easy access:
+
+```{r, eval=FALSE}
+md.pattern(hmda_ml,rotate.names = TRUE)
+hmda_fill <- complete(mice(hmda_ml, maxit = 1))
+write.csv(hmda_fill,"testset1_imp.csv")
+```
+
+![NA Pattern](mdpatt.png)
+
+
+
+
+
+
+
+
